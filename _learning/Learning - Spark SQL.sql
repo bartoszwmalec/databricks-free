@@ -43,7 +43,10 @@ SELECT version()          AS spark_version,
        current_catalog()  AS catalog,
        current_schema()   AS schema,
        current_timezone() AS session_tz,
-       current_date()     AS today;
+       current_date()     AS today,
+       current_timestamp()  AS ts_now,
+       current_user()     AS user_name,
+       session_user()     AS user_name_alias;
 
 -- COMMAND ----------
 
@@ -429,6 +432,23 @@ CROSS JOIN LATERAL (
   LIMIT 1
 ) b
 ORDER BY m.month;
+
+-- COMMAND ----------
+
+-- feedback_bronze as a TEMP VIEW loaded from the CSV stored in the Unity Catalog Volume (responses = JSON string)
+CREATE OR REPLACE TEMPORARY VIEW feedback_bronze AS
+SELECT meeting_uuid, responses FROM read_files('/Volumes/workspace/learning/learning_volume/feedback_bronze.csv', format => 'csv', header => true, escape => '"', schema => 'meeting_uuid STRING, responses STRING');
+
+-- COMMAND ----------
+
+SELECT
+  feedback.meeting_uuid,
+  response.value:answer::STRING AS answer,
+  response.value:question::STRING AS question,
+  response.value:question_id::STRING AS question_id,
+  response.value:respondent_id::STRING AS respondent_id
+FROM feedback_bronze AS feedback
+CROSS JOIN LATERAL variant_explode_outer(parse_json(feedback.responses)) AS response
 
 -- COMMAND ----------
 
