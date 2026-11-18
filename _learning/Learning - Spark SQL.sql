@@ -774,6 +774,92 @@ ORDER BY emp_id;
 -- COMMAND ----------
 
 -- MAGIC %md
+-- MAGIC **Hash functions** — all seven of the Spark SQL reference ([Hash Functions](https://spark.apache.org/docs/latest/api/sql/hash-functions/))
+-- MAGIC
+-- MAGIC | Function | Returns | Notes |
+-- MAGIC |---|---|---|
+-- MAGIC | `crc32(expr)` | `BIGINT` | cyclic redundancy check (CRC-32) of a binary |
+-- MAGIC | `hash(expr1, expr2, …)` | `INT` | 32-bit Murmur3, seed 42 — any number of arguments of any type |
+-- MAGIC | `xxhash64(expr1, expr2, …)` | `BIGINT` | 64-bit xxHash, seed 42 — any number of arguments of any type |
+-- MAGIC | `md5(expr)` | `STRING` (32 hex chars) | 128-bit MD5 of a binary |
+-- MAGIC | `sha(expr)` / `sha1(expr)` | `STRING` (40 hex chars) | SHA-1 of a binary — two names, one function |
+-- MAGIC | `sha2(expr, bitLength)` | `STRING` | SHA-2 family: 224, 256, 384 or 512 bits (`0` = 256) |
+-- MAGIC
+-- MAGIC * `crc32`, `md5`, `sha`, `sha1`, `sha2` take a **binary** — a string argument is hashed as its UTF-8 bytes.
+-- MAGIC * `hash` / `xxhash64` are fast and non-cryptographic: bucketing, sampling, deterministic keys. 32 / 64 bits means collisions are possible, so they should not be the only identity of a row.
+-- MAGIC * For **change detection (hash-diff)** hash the whole row as ONE value, e.g. `sha2(to_json(struct(*)), 256)`: `concat_ws` silently skips NULLs and `hash` / `xxhash64` skip NULL arguments, so `('a', NULL, 'b')` and `('a', 'b', NULL)` collide (second cell below).
+-- MAGIC * `md5` / `sha1` are fine as checksums but are **not** collision-resistant — use `sha2(…, 256)` when that matters.
+-- MAGIC
+-- MAGIC 🔁 Elsewhere: Snowflake `HASH()` (64-bit), `MD5`, `SHA2`; BigQuery `FARM_FINGERPRINT()`, `MD5`, `SHA256` / `SHA512` (return BYTES); T-SQL `HASHBYTES('SHA2_256', …)`, `CHECKSUM`.
+
+-- COMMAND ----------
+
+-- 6.x Hash functions: every function of the Spark SQL "Hash Functions" reference with its
+-- documented example, the result here, the documented result and the return type
+SELECT fn, example, result, documented, result = documented AS matches_docs, return_type
+FROM (
+            SELECT 'crc32'    AS fn, "crc32('Spark')"                   AS example,
+                   CAST(crc32('Spark') AS STRING)                     AS result,
+                   '1557323817'                                       AS documented,
+                   typeof(crc32('Spark'))                             AS return_type
+  UNION ALL SELECT 'hash',         "hash('Spark', array(123), 2)",
+                   CAST(hash('Spark', array(123), 2) AS STRING),      '-1321691492',
+                   typeof(hash('Spark', array(123), 2))
+  UNION ALL SELECT 'xxhash64',     "xxhash64('Spark', array(123), 2)",
+                   CAST(xxhash64('Spark', array(123), 2) AS STRING),  '5602566077635097486',
+                   typeof(xxhash64('Spark', array(123), 2))
+  UNION ALL SELECT 'md5',          "md5('Spark')",
+                   md5('Spark'),                                      '8cde774d6f7333752ed72cacddb05126',
+                   typeof(md5('Spark'))
+  UNION ALL SELECT 'sha',          "sha('Spark')",
+                   sha('Spark'),                                      '85f5955f4b27a9a4c2aab6ffe5d7189fc298b92c',
+                   typeof(sha('Spark'))
+  UNION ALL SELECT 'sha1',         "sha1('Spark')",
+                   sha1('Spark'),                                     '85f5955f4b27a9a4c2aab6ffe5d7189fc298b92c',
+                   typeof(sha1('Spark'))
+  UNION ALL SELECT 'sha2',         "sha2('Spark', 256)",
+                   sha2('Spark', 256),                                '529bc3b07127ecb7e53a4dcf1991d9152c24537d919178022b2c42657f79a26b',
+                   typeof(sha2('Spark', 256))
+)
+
+-- COMMAND ----------
+
+-- sha2 bit lengths, NULL handling, binary input — and why a multi-column hash needs care
+SELECT
+  length(sha2('Spark', 224)) * 4                       AS sha224_bits,     -- hex string: 4 bits per char
+  length(sha2('Spark', 256)) * 4                       AS sha256_bits,
+  length(sha2('Spark', 384)) * 4                       AS sha384_bits,
+  length(sha2('Spark', 512)) * 4                       AS sha512_bits,
+  sha2('Spark', 0) = sha2('Spark', 256)                AS bitlength_0_is_256,
+  sha2('Spark', 1)                                     AS unsupported_bitlength,     -- not 0/224/256/384/512 -> NULL
+  md5(CAST('Spark' AS BINARY)) = md5('Spark')          AS string_hashed_as_utf8_bytes,
+  md5(CAST(NULL AS STRING))                            AS md5_of_null,               -- NULL in, NULL out
+  hash(CAST(NULL AS STRING))                           AS hash_of_null,              -- NULL is skipped: the seed (42) comes back
+  xxhash64(CAST(NULL AS STRING))                       AS xxhash64_of_null,
+  -- the multi-column pitfall: a NULL in a different position gives the SAME hash
+  hash('a', NULL, 'b') = hash('a', 'b', NULL)                         AS hash_collision,
+  sha2(concat_ws('|', 'a', NULL, 'b'), 256)
+    = sha2(concat_ws('|', 'a', 'b', NULL), 256)                       AS concat_ws_collision,
+  -- ... and the fix: hash the whole tuple as ONE value (field names keep the positions apart)
+  sha2(to_json(named_struct('c1', 'a', 'c2', CAST(NULL AS STRING), 'c3', 'b')), 256)
+    = sha2(to_json(named_struct('c1', 'a', 'c2', 'b', 'c3', CAST(NULL AS STRING))), 256) AS to_json_collision
+
+-- COMMAND ----------
+
+-- In practice on the employees table: bucketing, deterministic keys, checksums and a NULL-safe row fingerprint
+SELECT emp_id, name, dept, salary, manager_id,
+       pmod(hash(emp_id), 4)                    AS bucket_of_4,      -- hash() can be negative: pmod, not %
+       xxhash64(emp_id)                         AS emp_key_64,       -- deterministic 64-bit surrogate key
+       crc32(CAST(emp_id AS STRING))            AS emp_crc32,        -- quick checksum (bigint)
+       md5(to_json(struct(*)))                  AS row_md5,          -- 128-bit fingerprint (compatibility)
+       sha1(to_json(struct(*)))                 AS row_sha1,         -- = sha(...)
+       sha2(to_json(struct(*)), 256)            AS row_hash_diff     -- whole row as ONE value: NULL-safe change detection
+FROM employees
+ORDER BY emp_id
+
+-- COMMAND ----------
+
+-- MAGIC %md
 -- MAGIC ## 7. Windows, QUALIFY, GROUP BY ALL, PIVOT & friends
 -- MAGIC
 -- MAGIC * **Named windows** – define once in `WINDOW w AS (…)`, reuse with `OVER w`.
